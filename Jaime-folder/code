@@ -1,0 +1,138 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import math
+
+# ──────────────────────────────────────────────
+print("🔄 Loading YOLO models...")
+
+# General YOLO model
+model_general = YOLO("yolov8m.pt")  # or yolov8n.pt
+
+# Custom trained YOLO model
+model_custom = YOLO("/root/yolo_box_project/yolobp/runs/detect/yolobp_results/weights/best.pt")
+
+print("✅ YOLO (Dual Model Mode) running on DroidCam HTTP stream...")
+
+# ──────────────────────────────────────────────
+# DroidCam HTTP stream
+url = "http://10.108.217.178:4747/video"
+cap = cv2.VideoCapture(url)
+
+if not cap.isOpened():
+    print("❌ Failed to open DroidCam stream.")
+    exit()
+
+print("📷 Stream resolution:", int(cap.get(3)), "x", int(cap.get(4)))
+print("🎮 Controls:")
+print("   [g] → General model only")
+print("   [b] → Custom box model only")
+print("   [a] → Both models (default)")
+print("   [q] → Quit\n")
+
+# ──────────────────────────────────────────────
+def draw_centers_and_orientation(results, frame):
+    for box in results[0].boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        # --- Center ---
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)  # Yellow dot
+
+        # --- Orientation estimation ---
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+          if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            if len(cnt) >= 5:  # Need at least 5 points for ellipse
+                ellipse = cv2.fitEllipse(cnt)
+                (xc, yc), (d1, d2), raw_angle = ellipse
+
+                # Convert raw OpenCV angle to camera-relative (horizontal baseline)
+                # OpenCV gives angle in [0,180) w.r.t. the ellipse’s major axis
+                # We align it so that 0° = perfectly horizontal to the right
+                orientation = (90 - raw_angle) % 180
+
+                # Draw ellipse showing object orientation
+                ellipse_center = (int(x1 + xc), int(y1 + yc))
+                cv2.ellipse(frame, (ellipse_center, (int(d1), int(d2)), raw_angle), (0, 0, 255), 2)
+
+                # Draw orientation line (for visual clarity)
+                length = 50
+                rad = math.radians(orientation)
+                x2_line = int(ellipse_center[0] + length * math.cos(rad))
+                y2_line = int(ellipse_center[1] - length * math.sin(rad))
+                cv2.line(frame, ellipse_center, (x2_line, y2_line), (0, 255, 0), 2)
+
+                # Display angle relative to camera
+                cv2.putText(frame, f"{orientation:.1f} deg", (cx + 10, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 128, 255), 2)
+
+        cv2.putText(frame, f"({cx}, {cy})", (cx + 10, cy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+# ──────────────────────────────────────────────
+mode = "a"  # both models active by default
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("⚠️ Stream read failed, retrying...")
+        continue
+
+    frame_resized = cv2.resize(frame, (640, 640))
+
+    # ──────────────────────────────────────────────
+    # Perform detections
+    if mode.lower() == "g":
+        results_general = model_general(frame_resized)
+        annotated_frame = results_general[0].plot()
+        draw_centers_and_orientation(results_general, annotated_frame)
+        cv2.rectangle(annotated_frame, (5, 5), (200, 40), (0, 0, 255), -1)
+        cv2.putText(annotated_frame, "General Model", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    elif mode.lower() == "b":
+       results_custom = model_custom(frame_resized)
+        annotated_frame = results_custom[0].plot()
+        draw_centers_and_orientation(results_custom, annotated_frame)
+        cv2.rectangle(annotated_frame, (5, 5), (200, 40), (255, 0, 0), -1)
+        cv2.putText(annotated_frame, "Custom Box Model", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    else:  # both models
+        results_general = model_general(frame_resized)
+        results_custom = model_custom(frame_resized)
+        annotated_frame = results_general[0].plot()
+        annotated_frame = results_custom[0].plot(img=annotated_frame)
+        draw_centers_and_orientation(results_general, annotated_frame)
+        draw_centers_and_orientation(results_custom, annotated_frame)
+        cv2.rectangle(annotated_frame, (5, 5), (220, 40), (0, 128, 0), -1)
+        cv2.putText(annotated_frame, "Both Models", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # ──────────────────────────────────────────────
+    cv2.imshow("YOLO DroidCam", annotated_frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        break
+    elif key == ord("g"):
+        mode = "g"
+        print("🔁 Switched to General Model only.")
+    elif key == ord("b"):
+        mode = "b"
+        print("🔁 Switched to Custom Box Model only.")
+    elif key == ord("a"):
+        mode = "a"
+        print("🔁 Switched to Both Models.")
+
+cap.release()
+cv2.destroyAllWindows()
