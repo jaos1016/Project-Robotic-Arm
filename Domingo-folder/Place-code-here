@@ -1,1 +1,66 @@
+import rtde_control
+import time
+
+print("Connecting to robot...")
+rtde_c = rtde_control.RTDEControlInterface("192.168.8.161")
+time.sleep(1)
+
+# Pallet parameters
+x_spacing = -0.18  # 18 cm spacing in X direction
+y_spacing = -0.18 # 18 cm spacing in Y direction
+
+# Base position in Cartesian space (TCP pose) for first box
+base_joint = [-0.309, 0.0506, 0.170, 2.500, -1.900, 0.0000]
+
+# Define position offsets for 2x2 pallet (four positions)
+offsets = [
+    [0, 0],              # first box
+    [x_spacing, 0],      # second box
+    [0, y_spacing],      # third box
+    [x_spacing, y_spacing]  # fourth box
+]
+
+# Number of boxes
+num_boxes = len(offsets)
+
+for n in range(num_boxes):
+    print(f"\n=== Pick & Place cycle {n+1} ===")
+
+    # Move to pick pre-position
+    rtde_c.moveJ([-1.571, -1.571, -1.571, -1.571, 1.571, 3.142], 0.35, 0.1)
+    time.sleep(1)
+
+    # Move to pick position
+    rtde_c.moveJ([0.000, -1.571, -1.571, -1.571, 1.571, 3.142], 0.35, 0.1)
+    time.sleep(2)
+
+    # Pick position
+    rtde_c.moveJ([0.068, -2.220, -1.887, -0.606, 1.568, 3.182], 0.35, 0.1)
+    time.sleep(2)
+
+    # Lift up before moving
+    rtde_c.moveJ([0.027, -1.571, -1.571, -1.571, 1.571, 3.142], 0.35, 0.1)
+    time.sleep(2)
+
+    # Move near pallet
+    rtde_c.moveJ([-2.876, -1.571, -1.571, -1.571, 1.571, 3.142], 0.35, 0.1)
+    time.sleep(2)
+
+    # Compute target position by applying X/Y offsets (copy base!)
+    target_pose = base_joint.copy()
+    target_pose[0] += offsets[n][0]  # X offset
+    target_pose[1] += offsets[n][1]  # Y offset
+
+    print(f"Placing box {n+1} at pallet position: {target_pose}")
+
+    # Move to the target position using linear motion
+    rtde_c.moveL(target_pose, 0.25, 0.1)
+    time.sleep(2)
+
+    # Return to start
+    rtde_c.moveJ([-1.571, -1.571, -1.571, -1.571, 1.571, 3.142], 0.35, 0.1)
+    time.sleep(2)
+
+print("✅ Palletizing complete.")
+rtde_c.stopScript()
 
