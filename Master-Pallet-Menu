@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+import os
+import time
+import math
+import cv2
+from ultralytics import YOLO
+import rtde_control
+
+# =========================
+# USER CONFIG
+# =========================
+ROBOT_IP = "192.168.8.161"
+CAM_INDEX = 0
+WEIGHTS_PATH = "Developer/EEE5772/best.pt"
+IMG_SIZE = 640
+CONF_THRESH = 0.45
+BOX_CLASS_NAMES = {"box", "carton", "package"}  # or None
+
+# Motion parameters
+SPEED_J = 0.35   # match first script joint speed
+ACCEL_J = 0.10
+SPEED_L = 0.25
+ACCEL_L = 0.10
+
+# Joint positions in degrees for HOME/SCAN (for H/S keys only)
+HOME_DEG = (-90, -90, -90, -90, 90, 90)
+SCAN_DEG = (-124, -104, -35, -131, 89, 145)
+
+# === Pallet motion as in FIRST SCRIPT ===
+
+# Base TCP pose for first box (x, y, z, rx, ry, rz)
+BASE_PALLET_POSE = [-0.309, 0.0506, 0.170, 2.500, -1.900, 0.0000]
+
+# Pallet spacings (meters)
+X_SPACING = -0.18  # 18 cm in X
+Y_SPACING = -0.18  # 18 cm in Y
+
+# Offsets for 2x2 pallet (four positions)
+PALLET_OFFSETS = [
+    [0.0,        0.0],        # slot 1
+    [X_SPACING,  0.0],        # slot 2
+    [0.0,        Y_SPACING],  # slot 3
+    [X_SPACING,  Y_SPACING],  # slot 4
+]
+
+# Joint positions (radians) for the pick & place sequence (from first script)
+PICK_PRE_Q    = [-1.571, -1.571, -1.571, -1.571,  1.571,  3.142]
+PICK_ABOVE_Q  = [ 0.000, -1.571, -1.571, -1.571,  1.571,  3.142]
+PICK_Q        = [ 0.068, -2.220, -1.887, -0.606,  1.568,  3.182]
+LIFT_Q        = [ 0.027, -1.571, -1.571, -1.571,  1.571,  3.142]
+NEAR_PALLET_Q = [-2.876, -1.571, -1.571, -1.571,  1.571,  3.142]
+
+# We'll use PICK_PRE_Q as "home" for the pallet sequence
+PALLET_HOME_Q = PICK_PRE_Q
+# =========================
+
+
+def resolve_weights_path(p: str) -> str:
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(os.path.expanduser("~"), p)
+    return p
+
+
+def deg_list_to_rad(deg_tuple):
+    return [math.radians(x) for x in deg_tuple]
+
+
+def annotate_detections(image, pred, conf_thresh, allowed_names=None):
+    """Draw YOLO detections and return annotated image + summary"""
+    out = image.copy()
+    names = pred.names
+    allowed_l = {n.lower() for n in allowed_names} if allowed_names else None
+
+    det_count = 0
+    best = None
+    if pred.boxes is None or len(pred.boxes) == 0:
+        return out, det_count, best
+
+    for b in pred.boxes:
+        conf = float(b.conf[0].item())
+        if conf < conf_thresh:
+            continue
+        cls_id = int(b.cls[0].item())
+        cls_name = str(names.get(cls_id, cls_id))
+        if allowed_l and cls_name.lower() not in allowed_l:
+            continue
+
+        x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+        det_count += 1
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(out, f"{cls_name} {conf:.2f}", (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        if best is None or conf > best[0]:
+            best = (conf, cls_name, (x1, y1, x2, y2))
+    return out, det_count, best
+
+
+def get_pallet_pose(slot_idx: int):
+    """Return TCP pose for pallet slot 0–3, using same logic as first script."""
+    dx, dy = PALLET_OFFSETS[slot_idx]
+    pose = BASE_PALLET_POSE.copy()
+    pose[0] += dx
+    pose[1] += dy
+    return pose
+
+
+def pick_and_place_to_pallet_slot(rtde_c, slot_idx: int):
+    """
+    Run the SAME pick → lift → move-near-pallet → moveL-to-slot → home
+    sequence as your first working script, for a given pallet slot.
+    """
+    target_pose = get_pallet_pose(slot_idx)
+    print(f"[CYCLE] Slot {slot_idx + 1}, target pose: {target_pose}")
+
+    # Move to pick pre-position
+    rtde_c.moveJ(PICK_PRE_Q, SPEED_J, ACCEL_J)
+    time.sleep(1)
+
+    # Move above pick position
+    rtde_c.moveJ(PICK_ABOVE_Q, SPEED_J, ACCEL_J)
+    time.sleep(2)
+
+    # Move to pick position
+    rtde_c.moveJ(PICK_Q, SPEED_J, ACCEL_J)
+    time.sleep(2)
+
+    # TODO: Close gripper here
+
+    # Lift up before moving
+    rtde_c.moveJ(LIFT_Q, SPEED_J, ACCEL_J)
+    time.sleep(2)
+
+    # Move near pallet
+    rtde_c.moveJ(NEAR_PALLET_Q, SPEED_J, ACCEL_J)
+    time.sleep(2)
+
+    # Move to the target pallet position using linear motion
+    rtde_c.moveL(target_pose, SPEED_L, ACCEL_L)
+    time.sleep(2)
+
+    # TODO: Open gripper here
+
+    # Return to pallet "home"/start
+    rtde_c.moveJ(PALLET_HOME_Q, SPEED_J, ACCEL_J)
+    time.sleep(2)
+
+
+def main():
+    # === Load YOLO model ===
+    weights = resolve_weights_path(WEIGHTS_PATH)
+    if not os.path.exists(weights):
+        raise FileNotFoundError(f"YOLO weights not found: {weights}")
+    print(f"[YOLO] Loading weights from: {weights}")
+    model = YOLO(weights)
+
+    # === Connect to robot ===
+    print(f"[RTDE] Connecting to robot @ {ROBOT_IP} ...")
+    rtde_c = rtde_control.RTDEControlInterface(ROBOT_IP)
+    print("[RTDE] Connected.")
+
+    HOME_Q = deg_list_to_rad(HOME_DEG)
+    SCAN_Q = deg_list_to_rad(SCAN_DEG)
+
+    # === Open camera ===
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+
+    cv2.namedWindow("Live", cv2.WINDOW_NORMAL)
+    print("\n--- CONTROL MENU ---")
+    print("Press:")
+    print("  1 → Full pick & place cycle to pallet position 1")
+    print("  2 → Full pick & place cycle to pallet position 2")
+    print("  3 → Full pick & place cycle to pallet position 3")
+    print("  4 → Full pick & place cycle to pallet position 4")
+    print("  A → Automatic loop through positions 1–4")
+    print("  C → Capture image + run YOLO detection")
+    print("  H → Move robot to HOME (joint)")
+    print("  S → Move robot to SCAN position (joint)")
+    print("  Q → Quit\n")
+
+    try:
+        while True:
+            # Show live camera feed
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            cv2.imshow("Live", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            # --- Pallet motions (same as first code) ---
+            if key in [ord('1'), ord('2'), ord('3'), ord('4')]:
+                idx = int(chr(key)) - 1
+                print(f"[MOVE] → FULL CYCLE to pallet position {idx + 1}")
+                pick_and_place_to_pallet_slot(rtde_c, idx)
+
+            elif key in [ord('a'), ord('A')]:
+                print("[AUTO] Running automatic loop 1→4...")
+                for idx in range(4):
+                    print(f"[AUTO] Cycle {idx + 1}/4")
+                    pick_and_place_to_pallet_slot(rtde_c, idx)
+                print("[AUTO] Loop complete.")
+
+            # --- Extra joint motions (as you had) ---
+            elif key in [ord('h'), ord('H')]:
+                print("[MOVE] → HOME (joint)")
+                rtde_c.moveJ(HOME_Q, SPEED_J, ACCEL_J)
+
+            elif key in [ord('s'), ord('S')]:
+                print("[MOVE] → SCAN (joint)")
+                rtde_c.moveJ(SCAN_Q, SPEED_J, ACCEL_J)
+
+            # --- YOLO detection ---
+            elif key in [ord('c'), ord('C')]:
+                print("[CAM] Capturing frame and running YOLO...")
+                pred = model(frame, imgsz=IMG_SIZE, conf=CONF_THRESH, verbose=False)[0]
+                annotated, det_count, best = annotate_detections(
+                    frame, pred, CONF_THRESH, BOX_CLASS_NAMES
+                )
+
+                if best:
+                    conf, cls_name, bbox = best
+                    print(f"[YOLO] Best detection: {cls_name} ({conf:.2f}) bbox={bbox}")
+                else:
+                    print("[YOLO] No detections found")
+
+                cv2.imshow("Detections", annotated)
+                cv2.waitKey(0)
+                cv2.destroyWindow("Detections")
+
+            # --- Quit ---
+            elif key in [ord('q'), ord('Q')]:
+                print("[EXIT] Stopping...")
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        rtde_c.stopScript()
+        print("[CLEANUP] Camera and robot disconnected. Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
