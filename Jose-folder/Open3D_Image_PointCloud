@@ -1,0 +1,147 @@
+import argparse
+import numpy as np
+import open3d as o3d
+
+
+def image_to_textured_plane(img_path):
+    """Create a 3D rectangular mesh with the image as its texture."""
+    # Read image as Open3D Image
+    img = o3d.io.read_image(img_path)
+
+    # Create a simple 2x3 rectangle in the XY-plane (z = 0)
+    # 4 vertices: (0,0,0), (W,0,0), (W,H,0), (0,H,0)
+    # We'll normalize to width=1, height=H/W to keep aspect ratio
+    w = img.width
+    h = img.height
+    aspect = h / w if w != 0 else 1.0
+
+    mesh = o3d.geometry.TriangleMesh()
+    # Vertices (X, Y, Z)
+    mesh.vertices = o3d.utility.Vector3dVector([
+        [0.0,      0.0,       0.0],  # v0
+        [1.0,      0.0,       0.0],  # v1
+        [1.0, aspect,       0.0],  # v2
+        [0.0, aspect,       0.0],  # v3
+    ])
+
+    # Two triangles: (v0, v1, v2) and (v0, v2, v3)
+    mesh.triangles = o3d.utility.Vector3iVector([
+        [0, 1, 2],
+        [0, 2, 3],
+    ])
+
+    # UV coordinates per-vertex (for each triangle vertex)
+    # Here we map the whole image to the plane:
+    # (0,0) bottom-left, (1,1) top-right
+    triangle_uvs = [
+        [0.0, 0.0],  # v0
+        [1.0, 0.0],  # v1
+        [1.0, 1.0],  # v2
+
+        [0.0, 0.0],  # v0
+        [1.0, 1.0],  # v2
+        [0.0, 1.0],  # v3
+    ]
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+
+    # Tell Open3D that this mesh uses triangle uvs
+    mesh.triangle_material_ids = o3d.utility.IntVector([0, 0])
+
+    # Attach the image as a texture
+    mesh.textures = [img]
+
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def image_to_heightmap(img_path, scale=0.2, step=4):
+    """
+    Turns a grayscale version of the image into a heightmap surface.
+    - scale: vertical exaggeration (height)
+    - step: sampling step (bigger = fewer vertices, faster)
+    """
+    import cv2  # Only used here; install with: pip install opencv-python
+
+    # Load with OpenCV for easier grayscale access
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Could not load image: {img_path}")
+
+    # Downsample for speed
+    img_ds = img[::step, ::step]
+    h, w = img_ds.shape
+
+    # Normalize to [0, 1]
+    z = img_ds.astype(np.float32) / 255.0
+    z *= scale  # Height scale
+
+    # Create grid of X, Y
+    xs = np.linspace(0, 1.0, w)
+    ys = np.linspace(0, 1.0 * h / w, h)  # keep aspect ratio
+    X, Y = np.meshgrid(xs, ys)
+
+    # Flatten
+    Xf = X.reshape(-1)
+    Yf = Y.reshape(-1)
+    Zf = z.reshape(-1)
+
+    vertices = np.stack([Xf, Yf, Zf], axis=1)
+
+    # Create triangles for the grid
+    triangles = []
+    for i in range(h - 1):
+        for j in range(w - 1):
+            v0 = i * w + j
+            v1 = v0 + 1
+            v2 = v0 + w
+            v3 = v2 + 1
+
+            # two triangles per quad
+            triangles.append([v0, v1, v2])
+            triangles.append([v1, v3, v2])
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles, dtype=np.int32))
+    mesh.compute_vertex_normals()
+
+    # Optional: color by height
+    colors = (Zf - Zf.min()) / (Zf.ptp() + 1e-8)
+    colors = np.stack([colors, colors, colors], axis=1)  # grayscale color
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
+    return mesh
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert an image into a 3D object using Open3D.")
+    parser.add_argument("image", help="Path to the input image (e.g., .png, .jpg)")
+    parser.add_argument(
+        "--mode",
+        choices=["plane", "heightmap"],
+        default="plane",
+        help="How to convert the image: 'plane' (textured quad) or 'heightmap' (3D surface).",
+    )
+    parser.add_argument(
+        "--save",
+        default=None,
+        help="Optional path to save the mesh (e.g., output.obj or output.ply).",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "plane":
+        mesh = image_to_textured_plane(args.image)
+    else:
+        mesh = image_to_heightmap(args.image)
+
+    # Show it (requires working OpenGL)
+    o3d.visualization.draw_geometries([mesh])
+
+    # Optionally save to disk
+    if args.save is not None:
+        print(f"Saving mesh to {args.save}")
+        o3d.io.write_triangle_mesh(args.save, mesh)
+
+
+if __name__ == "__main__":
+    main()
